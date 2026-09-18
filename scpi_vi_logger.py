@@ -54,9 +54,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESOURCE = "TCPIP0::10.68.63.118::5025::SOCKET"
 INTERVAL = 30.0
 CHANNELS = [1]
-OUTFILE = os.path.join(SCRIPT_DIR, "dummy_test1_power_log.csv")
+OUTFILE = os.path.join(SCRIPT_DIR, "dummy_test2_power_log.csv")
 TIMEOUT_MS = 5000
-GIT_INTERVAL = 60.0   # commit + push the CSV this often
+GIT_INTERVAL = 300.0   # commit + push the CSV this often
 
 # R&S returns 9.91E37 for "measurement not available". Parsing it as a real
 # number would put a garbage spike in your data.
@@ -335,6 +335,95 @@ class GitPusher:
         self._thread.join(timeout=60)
 
 
+# --------------------------------------------------------- PSU waveform
+class PsuWaveform:
+    """Drives an alternating current-setpoint square wave on an R&S NGE100
+    PSU, on its own thread and its own VISA link.
+
+    The NGE100's onboard Arbitrary/EasyArb engine only runs on channel 1
+    (confirmed in the R&S NGE100 user manual, "Arbitrary Commands" section -
+    every ARBitrary:* command is documented as acting on "channel 1"), so it
+    can't drive two parallel-wired channels together. At a multi-minute
+    period, host-timed SCPI writes are far more precise than needed, so this
+    just sets SOUR:CURR on each channel directly instead of using ARB.
+
+    Runs independently of the DMM link and the git pusher so a PSU comms
+    hiccup never stops DMM logging, and vice versa.
+    """
+
+    def __init__(self, resource, backend, timeout_ms, channels,
+                 peak_current, mod_depth, period_s, duty, voltage):
+        self.link = Link(resource, backend, timeout_ms)
+        self.channels = channels
+        self.high = peak_current / len(channels)
+        self.low = peak_current * (1 - mod_depth) / len(channels)
+        self.high_time = period_s * duty
+        self.low_time = period_s - self.high_time
+        self.voltage = voltage
+        self._stop = threading.Event()
+        self._thread = None
+        # Read from the main thread for CSV logging; plain attribute writes
+        # are atomic under the GIL, so no lock is needed for this.
+        self.phase = "pending"
+        self.target_total_A = None
+
+    def _apply(self, current):
+        for ch in self.channels:
+            self.link.write(f"INST:NSEL {ch}")
+            self.link.write(f"SOUR:CURR {current:.4f}")
+
+    def _ensure_connected(self):
+        if self.link.up:
+            return True
+        try:
+            self.link.open()
+            log(f"psu connected: {self.link.idn}")
+            if self.voltage is not None:
+                for ch in self.channels:
+                    self.link.write(f"INST:NSEL {ch}")
+                    self.link.write(f"SOUR:VOLT {self.voltage}")
+                log(f"psu: voltage set to {self.voltage:g} V on ch{self.channels}")
+            return True
+        except Exception as e:
+            log(f"psu link down: {e}")
+            self.link.close()
+            return False
+
+    def _run(self):
+        state_high = True
+        while not self._stop.is_set():
+            if not self._ensure_connected():
+                if self._stop.wait(10):
+                    break
+                continue
+            level = self.high if state_high else self.low
+            try:
+                self._apply(level)
+                total = level * len(self.channels)
+                self.phase = "high" if state_high else "low"
+                self.target_total_A = total
+                log(f"psu waveform: {level:.3f} A/ch "
+                    f"({total:.3f} A total, {self.phase})")
+            except COMM_ERRORS as e:
+                log(f"psu: set failed, dropping link: {e}")
+                self.link.close()
+                continue   # retry the connection right away, not after a full half-period
+            wait_s = self.high_time if state_high else self.low_time
+            state_high = not state_high
+            if self._stop.wait(wait_s):
+                break
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=10)
+        self.link.close()
+
+
 # ------------------------------------------------------------- simulator
 class FakeInstrument:
     """Stand-in that injects the failures a real run throws at you.
@@ -436,6 +525,27 @@ def main():
     p.add_argument("--git-repo-dir", default=SCRIPT_DIR,
                    help="git repo root (default: the folder this script lives in)")
     p.add_argument("--git-branch", default="main")
+    p.add_argument("--psu-resource", default=None,
+                   help="VISA resource for the R&S NGE100 PSU, e.g. "
+                        "USB0::0x0AAD::0x0197::<serial>::0::INSTR. "
+                        "Omit to disable PSU waveform control entirely.")
+    p.add_argument("--psu-backend", default="",
+                   help="VISA backend for the PSU ('' = installed vendor VISA, "
+                        "needed for USB; '@py' for pyvisa-py)")
+    p.add_argument("--psu-channels", type=int, nargs="+", default=[1, 2],
+                   help="PSU channels wired in parallel and driven together")
+    p.add_argument("--psu-voltage", type=float, default=None,
+                   help="voltage set on each PSU channel at startup "
+                        "(the shared CV ceiling for parallel-wired channels). "
+                        "Omit to leave voltage as already configured on the instrument.")
+    p.add_argument("--psu-peak-current", type=float, default=5.0,
+                   help="TOTAL peak current across all --psu-channels combined, in amps")
+    p.add_argument("--psu-mod-depth", type=float, default=0.8,
+                   help="modulation depth: low level = peak * (1 - depth)")
+    p.add_argument("--psu-period", type=float, default=240.0,
+                   help="waveform period in seconds (default 240 = 4 min = 4.17 mHz)")
+    p.add_argument("--psu-duty", type=float, default=0.5,
+                   help="fraction of the period spent at the high (peak) level")
     args = p.parse_args()
 
     if args.list:
@@ -451,6 +561,8 @@ def main():
     header = ["timestamp", "elapsed_s", "status"]
     for ch in args.channels:
         header += [f"ch{ch}_voltage_V", f"ch{ch}_current_A", f"ch{ch}_power_W"]
+    if args.psu_resource:
+        header += ["psu_target_A_total", "psu_phase"]
     sink = CsvSink(args.out, header)
 
     pusher = GitPusher(args.git_repo_dir, sink.path, args.git_interval, args.git_branch, args.git_push)
@@ -458,8 +570,24 @@ def main():
     if args.git_push:
         log(f"git auto-push enabled: every {args.git_interval:g}s to origin/{args.git_branch} in {args.git_repo_dir}")
 
+    psu = None
+    if args.psu_resource:
+        psu = PsuWaveform(args.psu_resource, args.psu_backend, args.timeout,
+                           args.psu_channels, args.psu_peak_current, args.psu_mod_depth,
+                           args.psu_period, args.psu_duty, args.psu_voltage)
+        psu.start()
+        low = args.psu_peak_current * (1 - args.psu_mod_depth)
+        log(f"psu waveform enabled on ch{args.psu_channels}: "
+            f"{args.psu_peak_current:g} A / {low:g} A total (peak/low), "
+            f"{args.psu_period:g}s period, {args.psu_duty:.0%} duty")
+        if args.psu_voltage is None:
+            log("psu: voltage left as already configured on the instrument "
+                "(pass --psu-voltage to set it explicitly)")
+
     link = Link(args.resource, args.backend, args.timeout, args.simulate)
     blanks = ["", "", ""] * len(args.channels)
+    if args.psu_resource:
+        blanks = blanks + ["", ""]
 
     t0 = time.monotonic()
     deadline = t0 + args.hours * 3600 if args.hours else None
@@ -509,6 +637,9 @@ def main():
                     cells = []
                     for v, i in readings:
                         cells += [f"{v:.6f}", f"{i:.6f}", f"{v * i:.6f}"]
+                    if psu is not None:
+                        target = psu.target_total_A
+                        cells += [f"{target:.4f}" if target is not None else "", psu.phase]
                     fail_streak = 0
                 except Exception as e:
                     log(f"sample failed, dropping link: {e}")
@@ -553,6 +684,8 @@ def main():
     finally:
         sink.close()
         link.close()
+        if psu is not None:
+            psu.stop()
         pusher.stop()
         hours = (time.monotonic() - t0) / 3600
         log(f"stopped after {hours:.2f} h - {written} rows "
