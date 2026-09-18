@@ -47,12 +47,16 @@ import time
 import pyvisa
 
 # ---------------------------------------------------------------- defaults
+# Anchored to the script's own folder (the git repo), not the caller's cwd,
+# so running it via a shortcut or from a different directory still writes
+# into - and pushes from - the right place.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESOURCE = "TCPIP0::10.68.63.118::5025::SOCKET"
 INTERVAL = 30.0
 CHANNELS = [1]
-OUTFILE = "power_log.csv"
+OUTFILE = os.path.join(SCRIPT_DIR, "dummy_test1_power_log.csv")
 TIMEOUT_MS = 5000
-GIT_INTERVAL = 300.0   # commit + push the CSV this often
+GIT_INTERVAL = 60.0   # commit + push the CSV this often
 
 # R&S returns 9.91E37 for "measurement not available". Parsing it as a real
 # number would put a garbage spike in your data.
@@ -429,8 +433,8 @@ def main():
                    help="disable automatic git commit/push")
     p.add_argument("--git-interval", type=float, default=GIT_INTERVAL,
                    help="seconds between git commit/push cycles (default 300 = 5 min)")
-    p.add_argument("--git-repo-dir", default=None,
-                   help="git repo root (default: directory containing --out)")
+    p.add_argument("--git-repo-dir", default=SCRIPT_DIR,
+                   help="git repo root (default: the folder this script lives in)")
     p.add_argument("--git-branch", default="main")
     args = p.parse_args()
 
@@ -449,11 +453,10 @@ def main():
         header += [f"ch{ch}_voltage_V", f"ch{ch}_current_A", f"ch{ch}_power_W"]
     sink = CsvSink(args.out, header)
 
-    repo_dir = args.git_repo_dir or os.path.dirname(sink.path) or "."
-    pusher = GitPusher(repo_dir, sink.path, args.git_interval, args.git_branch, args.git_push)
+    pusher = GitPusher(args.git_repo_dir, sink.path, args.git_interval, args.git_branch, args.git_push)
     pusher.start()
     if args.git_push:
-        log(f"git auto-push enabled: every {args.git_interval:g}s to origin/{args.git_branch} in {repo_dir}")
+        log(f"git auto-push enabled: every {args.git_interval:g}s to origin/{args.git_branch} in {args.git_repo_dir}")
 
     link = Link(args.resource, args.backend, args.timeout, args.simulate)
     blanks = ["", "", ""] * len(args.channels)
