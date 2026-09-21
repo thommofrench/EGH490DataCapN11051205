@@ -54,9 +54,12 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESOURCE = "TCPIP0::10.68.63.118::5025::SOCKET"
 INTERVAL = 30.0
 CHANNELS = [1]
-OUTFILE = os.path.join(SCRIPT_DIR, "dummy_test2_power_log.csv")
+OUTFILE = os.path.join(SCRIPT_DIR, "dummy_test4_AC_test_power_log.csv")
 TIMEOUT_MS = 5000
 GIT_INTERVAL = 300.0   # commit + push the CSV this often
+# The NGE103B on this bench. PSU control is ON by default; use --no-psu for a
+# DMM-only run so a quick check never energises the PSU outputs.
+PSU_RESOURCE = "USB0::0x0AAD::0x0197::5601.3800k03-113360::0::INSTR"
 
 # R&S returns 9.91E37 for "measurement not available". Parsing it as a real
 # number would put a garbage spike in your data.
@@ -187,6 +190,12 @@ def read_channel(link, ch, multichannel):
 
     MEAS: matters. A bare VOLT? gives the setpoint you programmed, not what
     the output is actually doing.
+
+    Current is read first and voltage last on purpose: each MEAS: query
+    switches the meter's measurement mode, and the mode left active between
+    samples loads the circuit. Ending on voltage leaves the meter in its
+    high-impedance mode instead of the low-impedance current mode, so the
+    idle meter doesn't disturb the source under test.
     """
     if multichannel:
         link.write(f"INST:NSEL {ch}")
@@ -195,8 +204,8 @@ def read_channel(link, ch, multichannel):
         got = link.query("INST:NSEL?")
         if int(float(got)) != ch:
             raise IOError(f"channel select failed: asked {ch}, got {got}")
-    v = parse_reading(link.query("MEAS:VOLT?"))
     i = parse_reading(link.query("MEAS:CURR?"))
+    v = parse_reading(link.query("MEAS:VOLT?"))
     return v, i
 
 
@@ -349,6 +358,11 @@ class PsuWaveform:
 
     Runs independently of the DMM link and the git pusher so a PSU comms
     hiccup never stops DMM logging, and vice versa.
+
+    On every (re)connect the voltage is set first, then the current for the
+    current phase, and only then are the channel outputs switched on, so the
+    output never comes up at a stale setpoint. Outputs are switched off again
+    on a clean shutdown (a hard kill can't do this).
     """
 
     def __init__(self, resource, backend, timeout_ms, channels,
@@ -366,17 +380,33 @@ class PsuWaveform:
         # are atomic under the GIL, so no lock is needed for this.
         self.phase = "pending"
         self.target_total_A = None
+        # True after each (re)connect until the outputs have been switched on,
+        # which happens in _run once the first current setpoint is applied.
+        self._needs_enable = True
 
     def _apply(self, current):
         for ch in self.channels:
             self.link.write(f"INST:NSEL {ch}")
             self.link.write(f"SOUR:CURR {current:.4f}")
 
+    def _set_outputs(self, on):
+        """Switch each driven channel's output on/off (per channel, so other
+        channels on the PSU are never touched), then surface any error the
+        instrument queued for it."""
+        state = "ON" if on else "OFF"
+        for ch in self.channels:
+            self.link.write(f"INST:NSEL {ch}")
+            self.link.write(f"OUTP:STAT {state}")
+        log(f"psu: outputs {state} on ch{self.channels}")
+        for e in drain_errors(self.link):
+            log(f"psu: instrument error after outputs {state}: {e}")
+
     def _ensure_connected(self):
         if self.link.up:
             return True
         try:
             self.link.open()
+            self._needs_enable = True
             log(f"psu connected: {self.link.idn}")
             if self.voltage is not None:
                 for ch in self.channels:
@@ -399,6 +429,10 @@ class PsuWaveform:
             level = self.high if state_high else self.low
             try:
                 self._apply(level)
+                if self._needs_enable:
+                    # Voltage went in on connect, current just now; safe to enable.
+                    self._set_outputs(True)
+                    self._needs_enable = False
                 total = level * len(self.channels)
                 self.phase = "high" if state_high else "low"
                 self.target_total_A = total
@@ -421,6 +455,16 @@ class PsuWaveform:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=10)
+        # Best effort: leave the PSU outputs off rather than stuck at the last
+        # level. Only if the link is already up - no reconnect attempt, so
+        # shutdown stays fast when the PSU is unreachable.
+        if self.link.up:
+            try:
+                self._set_outputs(False)
+            except Exception as e:
+                log(f"psu: could not switch outputs off on exit: {e}")
+        else:
+            log("psu: link down at exit, outputs NOT switched off")
         self.link.close()
 
 
@@ -525,19 +569,22 @@ def main():
     p.add_argument("--git-repo-dir", default=SCRIPT_DIR,
                    help="git repo root (default: the folder this script lives in)")
     p.add_argument("--git-branch", default="main")
-    p.add_argument("--psu-resource", default=None,
+    p.add_argument("--psu-resource", default=PSU_RESOURCE,
                    help="VISA resource for the R&S NGE100 PSU, e.g. "
                         "USB0::0x0AAD::0x0197::<serial>::0::INSTR. "
-                        "Omit to disable PSU waveform control entirely.")
+                        "Defaults to the bench NGE103B; see --no-psu.")
+    p.add_argument("--no-psu", action="store_true",
+                   help="disable PSU waveform control entirely (DMM logging only); "
+                        "the PSU outputs are never touched")
     p.add_argument("--psu-backend", default="",
                    help="VISA backend for the PSU ('' = installed vendor VISA, "
                         "needed for USB; '@py' for pyvisa-py)")
     p.add_argument("--psu-channels", type=int, nargs="+", default=[1, 2],
                    help="PSU channels wired in parallel and driven together")
-    p.add_argument("--psu-voltage", type=float, default=None,
-                   help="voltage set on each PSU channel at startup "
-                        "(the shared CV ceiling for parallel-wired channels). "
-                        "Omit to leave voltage as already configured on the instrument.")
+    p.add_argument("--psu-voltage", type=float, default=1,
+                   help="voltage set on each PSU channel at startup/reconnect "
+                        "(the shared CV ceiling for parallel-wired channels), "
+                        "default 1 V.")
     p.add_argument("--psu-peak-current", type=float, default=5.0,
                    help="TOTAL peak current across all --psu-channels combined, in amps")
     p.add_argument("--psu-mod-depth", type=float, default=0.8,
@@ -547,6 +594,8 @@ def main():
     p.add_argument("--psu-duty", type=float, default=0.5,
                    help="fraction of the period spent at the high (peak) level")
     args = p.parse_args()
+    if args.no_psu:
+        args.psu_resource = None
 
     if args.list:
         list_resources(args.backend)
@@ -582,7 +631,11 @@ def main():
             f"{args.psu_period:g}s period, {args.psu_duty:.0%} duty")
         if args.psu_voltage is None:
             log("psu: voltage left as already configured on the instrument "
-                "(pass --psu-voltage to set it explicitly)")
+                "(pass --psu-voltage to set it explicitly); outputs will be "
+                "switched on once connected")
+        else:
+            log(f"psu: on connect will set {args.psu_voltage:g} V per channel, "
+                f"then switch outputs on")
 
     link = Link(args.resource, args.backend, args.timeout, args.simulate)
     blanks = ["", "", ""] * len(args.channels)
