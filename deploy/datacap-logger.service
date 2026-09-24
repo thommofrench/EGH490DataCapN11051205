@@ -1,0 +1,15 @@
+[Unit]
+Description=DataCap DMM/PSU USB logger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=thomas
+WorkingDirectory=/home/thomas/DataCap
+ExecStart=/home/thomas/datacap-venv/bin/python3 scpi_vi_logger_usb.py --backend @py --psu-backend @py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

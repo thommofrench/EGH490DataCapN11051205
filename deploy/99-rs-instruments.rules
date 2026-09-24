@@ -1,0 +1,12 @@
+# R&S NGE103B (PSU) and UDS500 (DMM), both USBTMC over USB.
+#
+# Copy to /etc/udev/rules.d/99-rs-instruments.rules, then:
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# GROUP=plugdev grants non-root access; add your user with:
+#   sudo usermod -aG plugdev $USER   (log out/in to take effect)
+#
+# power/control=on disables USB autosuspend for these two devices so a long
+# unattended run doesn't have the link silently drop after an idle period.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0aad", ATTR{idProduct}=="0197", MODE="0666", GROUP="plugdev", ATTR{power/control}="on"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0aad", ATTR{idProduct}=="0135", MODE="0666", GROUP="plugdev", ATTR{power/control}="on"
