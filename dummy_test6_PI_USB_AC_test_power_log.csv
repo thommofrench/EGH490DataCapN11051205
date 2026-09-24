@@ -199,3 +199,5 @@ timestamp,elapsed_s,status,ch1_voltage_V,ch1_current_A,ch1_power_W,psu_target_A_
 2026-09-24T15:53:10+10:00,1740.0,disconnected,,,,,
 2026-09-24T15:53:40+10:00,1770.0,disconnected,,,,,
 2026-09-24T15:54:10+10:00,1800.0,disconnected,,,,,
+2026-09-24T15:54:40+10:00,1830.0,reconnected,0.000001,0.000000,0.000000,5.0000,high
+2026-09-24T15:55:10+10:00,1860.0,ok,-0.000000,0.000000,-0.000000,5.0000,high
