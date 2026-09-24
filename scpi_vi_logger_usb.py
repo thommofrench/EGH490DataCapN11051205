@@ -36,7 +36,7 @@ import scpi_vi_logger as base
 
 # The DMM's USB address, e.g. "USB0::0x0AAD::0x0xxx::<serial>::0::INSTR".
 # Fill in from `--list` once the DMM is plugged in and switched on.
-DMM_USB_RESOURCE = ""
+DMM_USB_RESOURCE = "USB0::0x0AAD::0x0135::000100196::INSTR"
 
 
 class SharedRmLink(base.Link):

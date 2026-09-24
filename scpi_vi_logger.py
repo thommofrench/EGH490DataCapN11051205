@@ -54,7 +54,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESOURCE = "TCPIP0::10.68.63.118::5025::SOCKET"
 INTERVAL = 30.0
 CHANNELS = [1]
-OUTFILE = os.path.join(SCRIPT_DIR, "dummy_test4_AC_test_power_log.csv")
+OUTFILE = os.path.join(SCRIPT_DIR, "dummy_test5_USB_AC_test_power_log.csv")
 TIMEOUT_MS = 5000
 GIT_INTERVAL = 300.0   # commit + push the CSV this often
 # The NGE103B on this bench. PSU control is ON by default; use --no-psu for a
@@ -392,11 +392,20 @@ class PsuWaveform:
     def _set_outputs(self, on):
         """Switch each driven channel's output on/off (per channel, so other
         channels on the PSU are never touched), then surface any error the
-        instrument queued for it."""
+        instrument queued for it.
+
+        Per-channel OUTP:STAT only arms a channel; nothing actually comes out
+        until the NGE100's master output switch (OUTP:GEN, the front-panel
+        "Output" button) is also on. That switch is instrument-wide, so it's
+        only ever turned ON here, never OFF - flipping it off at shutdown
+        would kill any other channel someone else has running.
+        """
         state = "ON" if on else "OFF"
         for ch in self.channels:
             self.link.write(f"INST:NSEL {ch}")
             self.link.write(f"OUTP:STAT {state}")
+        if on:
+            self.link.write("OUTP:GEN ON")
         log(f"psu: outputs {state} on ch{self.channels}")
         for e in drain_errors(self.link):
             log(f"psu: instrument error after outputs {state}: {e}")
