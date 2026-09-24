@@ -54,7 +54,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESOURCE = "TCPIP0::10.68.63.118::5025::SOCKET"
 INTERVAL = 30.0
 CHANNELS = [1]
-OUTFILE = os.path.join(SCRIPT_DIR, "dummy_test5_USB_AC_test_power_log.csv")
+OUTFILE = os.path.join(SCRIPT_DIR, "dummy_test6_PI_USB_AC_test_power_log.csv")
 TIMEOUT_MS = 5000
 GIT_INTERVAL = 300.0   # commit + push the CSV this often
 # The NGE103B on this bench. PSU control is ON by default; use --no-psu for a
@@ -590,7 +590,7 @@ def main():
                         "needed for USB; '@py' for pyvisa-py)")
     p.add_argument("--psu-channels", type=int, nargs="+", default=[1, 2],
                    help="PSU channels wired in parallel and driven together")
-    p.add_argument("--psu-voltage", type=float, default=1,
+    p.add_argument("--psu-voltage", type=float, default=2,
                    help="voltage set on each PSU channel at startup/reconnect "
                         "(the shared CV ceiling for parallel-wired channels), "
                         "default 1 V.")
