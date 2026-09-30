@@ -54,7 +54,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESOURCE = "TCPIP0::10.68.63.118::5025::SOCKET"
 INTERVAL = 30.0
 CHANNELS = [1]
-OUTFILE = os.path.join(SCRIPT_DIR, "dummy_test6_PI_USB_AC_test_power_log.csv")
+OUTFILE = os.path.join(SCRIPT_DIR, "dummy_test7_PI_USB_AC_test_power_log.csv")
 TIMEOUT_MS = 5000
 GIT_INTERVAL = 300.0   # commit + push the CSV this often
 # The NGE103B on this bench. PSU control is ON by default; use --no-psu for a
@@ -303,22 +303,39 @@ class GitPusher:
             capture_output=True, text=True,
         )
 
+    def _git_retry(self, *args, attempts=5):
+        """Run git, retrying while another process holds the repo lock.
+
+        The AC run and the DC baseline run are separate logger processes
+        pushing from the same repo, so their add/commit/push cycles can
+        overlap and trip over each other's .git/index.lock or ref locks.
+        """
+        for n in range(attempts):
+            r = self._git(*args)
+            if r.returncode == 0 or ".lock" not in (r.stdout + r.stderr):
+                return r
+            time.sleep(1 + n + random.random() * 2)
+        return r
+
     def _push_once(self):
         try:
-            add = self._git("add", self.rel_path)
+            add = self._git_retry("add", self.rel_path)
             if add.returncode != 0:
                 log(f"git add failed: {add.stderr.strip()}")
                 return
-            commit = self._git(
+            commit = self._git_retry(
                 "commit", "-m",
                 f"data update {datetime.datetime.now().isoformat(timespec='seconds')}",
             )
-            if commit.returncode != 0:
-                if "nothing to commit" in (commit.stdout + commit.stderr).lower():
-                    return
+            # "nothing to commit" still falls through to the push: the other
+            # logger process may have committed our rows in its own commit, or
+            # an earlier push may have failed, leaving local commits unpushed.
+            out = (commit.stdout + commit.stderr).lower()
+            if commit.returncode != 0 and \
+                    "nothing to commit" not in out and "nothing added to commit" not in out:
                 log(f"git commit failed: {commit.stdout.strip()} {commit.stderr.strip()}")
                 return
-            push = self._git("push", "origin", self.branch)
+            push = self._git_retry("push", "origin", self.branch)
             if push.returncode != 0:
                 log(f"git push failed: {push.stderr.strip()}")
             else:
@@ -374,6 +391,11 @@ class PsuWaveform:
         self.high_time = period_s * duty
         self.low_time = period_s - self.high_time
         self.voltage = voltage
+        # --psu-mod-depth 0 gives a flat DC setpoint (the baseline run). The
+        # loop still re-applies it every half period, which harmlessly
+        # re-asserts the setpoint, but the phase is logged as "dc" rather than
+        # a meaningless high/low alternation.
+        self.dc = mod_depth == 0
         self._stop = threading.Event()
         self._thread = None
         # Read from the main thread for CSV logging; plain attribute writes
@@ -443,7 +465,7 @@ class PsuWaveform:
                     self._set_outputs(True)
                     self._needs_enable = False
                 total = level * len(self.channels)
-                self.phase = "high" if state_high else "low"
+                self.phase = "dc" if self.dc else ("high" if state_high else "low")
                 self.target_total_A = total
                 log(f"psu waveform: {level:.3f} A/ch "
                     f"({total:.3f} A total, {self.phase})")
@@ -593,11 +615,12 @@ def main():
     p.add_argument("--psu-voltage", type=float, default=2,
                    help="voltage set on each PSU channel at startup/reconnect "
                         "(the shared CV ceiling for parallel-wired channels), "
-                        "default 1 V.")
+                        "default 2 V.")
     p.add_argument("--psu-peak-current", type=float, default=5.0,
                    help="TOTAL peak current across all --psu-channels combined, in amps")
     p.add_argument("--psu-mod-depth", type=float, default=0.8,
-                   help="modulation depth: low level = peak * (1 - depth)")
+                   help="modulation depth: low level = peak * (1 - depth); "
+                        "0 = constant DC at --psu-peak-current (baseline run)")
     p.add_argument("--psu-period", type=float, default=240.0,
                    help="waveform period in seconds (default 240 = 4 min = 4.17 mHz)")
     p.add_argument("--psu-duty", type=float, default=0.5,
@@ -635,9 +658,13 @@ def main():
                            args.psu_period, args.psu_duty, args.psu_voltage)
         psu.start()
         low = args.psu_peak_current * (1 - args.psu_mod_depth)
-        log(f"psu waveform enabled on ch{args.psu_channels}: "
-            f"{args.psu_peak_current:g} A / {low:g} A total (peak/low), "
-            f"{args.psu_period:g}s period, {args.psu_duty:.0%} duty")
+        if psu.dc:
+            log(f"psu DC enabled on ch{args.psu_channels}: "
+                f"{args.psu_peak_current:g} A total, constant")
+        else:
+            log(f"psu waveform enabled on ch{args.psu_channels}: "
+                f"{args.psu_peak_current:g} A / {low:g} A total (peak/low), "
+                f"{args.psu_period:g}s period, {args.psu_duty:.0%} duty")
         if args.psu_voltage is None:
             log("psu: voltage left as already configured on the instrument "
                 "(pass --psu-voltage to set it explicitly); outputs will be "
