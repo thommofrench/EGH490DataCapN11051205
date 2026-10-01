@@ -57,6 +57,8 @@ CHANNELS = [1]
 OUTFILE = os.path.join(SCRIPT_DIR, "dummy_test7_PI_USB_AC_test_power_log.csv")
 TIMEOUT_MS = 5000
 GIT_INTERVAL = 300.0   # commit + push the CSV this often
+GIT_TIMEOUT = 90.0     # kill any single git command that runs longer than this
+STALE_LOCK_S = 600.0   # a .git lock file older than this is from a dead git
 # The NGE103B on this bench. PSU control is ON by default; use --no-psu for a
 # DMM-only run so a quick check never energises the PSU outputs.
 PSU_RESOURCE = "USB0::0x0AAD::0x0197::5601.3800k03-113360::0::INSTR"
@@ -298,27 +300,79 @@ class GitPusher:
         self._thread = None
 
     def _git(self, *args):
-        return subprocess.run(
-            ["git", *args], cwd=self.repo_dir,
-            capture_output=True, text=True,
+        """Run one git command, killed if it runs past GIT_TIMEOUT.
+
+        Without a timeout, one push that hangs on a dead WiFi link would block
+        this thread, and so every later push, for the rest of the run.
+
+        core.fsync makes git flush each object and ref to disk as it writes
+        it. Without it, a power cut on the Pi left a pushed commit as an empty
+        file in the local repo, and every commit after that failed.
+        """
+        p = subprocess.Popen(
+            ["git", "-c", "core.fsync=all", *args], cwd=self.repo_dir,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            # Own process group, so a timeout can kill git's ssh child too.
+            # Killing git alone leaves ssh holding the output pipes open and
+            # communicate() below would still hang.
+            start_new_session=(os.name != "nt"),
         )
+        try:
+            out, err = p.communicate(timeout=GIT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            _kill_tree(p)
+            out, err = p.communicate()
+            err += f"\n(git {args[0]} killed after {GIT_TIMEOUT:g}s)"
+        return subprocess.CompletedProcess(p.args, p.returncode, out, err)
+
+    def _clear_stale_locks(self):
+        """Delete git lock files left behind by a killed or crashed git.
+
+        A git that dies mid-command (timeout kill, power cut) leaves its
+        .lock file, and every later git command then refuses to run. A lock
+        older than STALE_LOCK_S can't belong to a live git: each git run is
+        killed after GIT_TIMEOUT, which is far shorter.
+        """
+        git_dir = os.path.join(self.repo_dir, ".git")
+        for root, dirs, files in os.walk(git_dir):
+            if root == git_dir:
+                dirs[:] = ["refs"]   # locks live in .git itself and under .git/refs
+            for name in files:
+                if not name.endswith(".lock"):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    age = time.time() - os.path.getmtime(path)
+                    if age > STALE_LOCK_S:
+                        os.remove(path)
+                        log(f"git: removed stale lock {os.path.relpath(path, self.repo_dir)} "
+                            f"({age / 60:.0f} min old)")
+                except OSError:
+                    pass   # already gone, or the other logger just took it
 
     def _git_retry(self, *args, attempts=5):
         """Run git, retrying while another process holds the repo lock.
 
         The AC run and the DC baseline run are separate logger processes
         pushing from the same repo, so their add/commit/push cycles can
-        overlap and trip over each other's .git/index.lock or ref locks.
+        overlap and trip over each other's .git/index.lock or ref locks. Their
+        pushes also start in step, and the remote then refuses whichever ref
+        update lands second ("cannot lock ref" / "failed to update ref").
         """
         for n in range(attempts):
             r = self._git(*args)
-            if r.returncode == 0 or ".lock" not in (r.stdout + r.stderr):
+            out = r.stdout + r.stderr
+            contended = (".lock" in out or "cannot lock ref" in out
+                         or "failed to update ref" in out)
+            if r.returncode == 0 or not contended:
                 return r
             time.sleep(1 + n + random.random() * 2)
         return r
 
     def _push_once(self):
         try:
+            self._clear_stale_locks()
             add = self._git_retry("add", self.rel_path)
             if add.returncode != 0:
                 log(f"git add failed: {add.stderr.strip()}")
@@ -358,7 +412,25 @@ class GitPusher:
         if self._thread is None:
             return
         self._stop.set()
-        self._thread.join(timeout=60)
+        # Long enough for a final add/commit/push that each run to the git
+        # timeout. The systemd units' TimeoutStopSec must stay above this.
+        self._thread.join(timeout=3 * GIT_TIMEOUT + 30)
+
+
+def _kill_tree(p):
+    """Kill a subprocess and everything it started."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                           capture_output=True)
+        else:
+            os.killpg(p.pid, signal.SIGKILL)   # p leads its own group
+    except (OSError, ProcessLookupError):
+        pass
+    try:
+        p.kill()
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------- PSU waveform

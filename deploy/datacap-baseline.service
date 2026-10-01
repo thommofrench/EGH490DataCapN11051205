@@ -10,6 +10,8 @@ Wants=network-online.target
 Type=simple
 User=thomas
 WorkingDirectory=/home/thomas/DataCap
+# Same clock fix, stop handling and timeout as datacap-logger.service.
+ExecStartPre=-+/bin/sh /home/thomas/DataCap/deploy/set-clock-from-github.sh
 ExecStart=/home/thomas/datacap-venv/bin/python3 scpi_vi_logger_usb.py --backend @py --psu-backend @py \
     -r USB0::0x0AAD::0x0135::000100194::INSTR \
     --psu-resource USB0::0x0AAD::0x0197::5601.3800k03-113353::0::INSTR \
@@ -17,6 +19,8 @@ ExecStart=/home/thomas/datacap-venv/bin/python3 scpi_vi_logger_usb.py --backend 
     -o dummy_test7_PI_USB_DC_baseline_power_log.csv
 Restart=on-failure
 RestartSec=10
+KillMode=mixed
+TimeoutStopSec=330
 
 [Install]
 WantedBy=multi-user.target

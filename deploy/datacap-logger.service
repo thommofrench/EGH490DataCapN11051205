@@ -7,9 +7,18 @@ Wants=network-online.target
 Type=simple
 User=thomas
 WorkingDirectory=/home/thomas/DataCap
+# Fix the clock before the first row is stamped. Runs as root (+) and may
+# fail (-) without stopping the logger; see the script for why.
+ExecStartPre=-+/bin/sh /home/thomas/DataCap/deploy/set-clock-from-github.sh
 ExecStart=/home/thomas/datacap-venv/bin/python3 scpi_vi_logger_usb.py --backend @py --psu-backend @py
 Restart=on-failure
 RestartSec=10
+# On stop, signal only the logger itself: it finishes the sample, switches the
+# PSU outputs off and makes a final git push. The default signals every
+# process in the service, which would also kill that git mid-write.
+KillMode=mixed
+# Longer than the logger's own wait for that final push (3 x 90 s + 30 s).
+TimeoutStopSec=330
 
 [Install]
 WantedBy=multi-user.target
