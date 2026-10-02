@@ -452,7 +452,19 @@ class PsuWaveform:
     current phase, and only then are the channel outputs switched on, so the
     output never comes up at a stale setpoint. Outputs are switched off again
     on a clean shutdown (a hard kill can't do this).
+
+    Between phase changes the PSU is pinged every CHECK_S. A PSU that was
+    power-cycled comes back with its outputs off and its old USB session
+    dead, so the ping fails, the link is rebuilt and the outputs re-enabled
+    within seconds rather than at the next phase change. A front-panel
+    Output-off is left alone: the USB link survives that, so it's never
+    mistaken for a restart. While the link is down the CSV's psu_phase reads
+    "psu_down" and the target is blank, so the data never claims a current
+    the PSU isn't being told to deliver.
     """
+
+    CHECK_S = 5.0       # ping interval between phase changes
+    RECONNECT_S = 10.0  # wait between failed connection attempts
 
     def __init__(self, resource, backend, timeout_ms, channels,
                  peak_current, mod_depth, period_s, duty, voltage):
@@ -466,7 +478,7 @@ class PsuWaveform:
         # --psu-mod-depth 0 gives a flat DC setpoint (the baseline run). The
         # loop still re-applies it every half period, which harmlessly
         # re-asserts the setpoint, but the phase is logged as "dc" rather than
-        # a meaningless high/low alternation.
+        # a meaningless high/low alternation. "psu_down" while disconnected.
         self.dc = mod_depth == 0
         self._stop = threading.Event()
         self._thread = None
@@ -522,33 +534,57 @@ class PsuWaveform:
             self.link.close()
             return False
 
+    def _mark_down(self):
+        self.phase = "psu_down"
+        self.target_total_A = None
+
     def _run(self):
         state_high = True
+        switch_at = None   # monotonic time of the next phase change; None = set it now
         while not self._stop.is_set():
-            if not self._ensure_connected():
-                if self._stop.wait(10):
-                    break
-                continue
-            level = self.high if state_high else self.low
+            # Nothing may escape this loop: a dead thread would leave the PSU
+            # uncontrolled for the rest of the run while DMM logging carried on.
             try:
-                self._apply(level)
-                if self._needs_enable:
-                    # Voltage went in on connect, current just now; safe to enable.
-                    self._set_outputs(True)
-                    self._needs_enable = False
-                total = level * len(self.channels)
-                self.phase = "dc" if self.dc else ("high" if state_high else "low")
-                self.target_total_A = total
-                log(f"psu waveform: {level:.3f} A/ch "
-                    f"({total:.3f} A total, {self.phase})")
+                if not self._ensure_connected():
+                    self._mark_down()
+                    self._stop.wait(self.RECONNECT_S)
+                    continue
+                now = time.monotonic()
+                if switch_at is not None and now >= switch_at:
+                    state_high = not state_high
+                    switch_at = None
+                if switch_at is None or self._needs_enable:
+                    level = self.high if state_high else self.low
+                    self._apply(level)
+                    if self._needs_enable:
+                        # Voltage went in on connect, current just now; safe to enable.
+                        self._set_outputs(True)
+                        self._needs_enable = False
+                    total = level * len(self.channels)
+                    self.phase = "dc" if self.dc else ("high" if state_high else "low")
+                    self.target_total_A = total
+                    log(f"psu waveform: {level:.3f} A/ch "
+                        f"({total:.3f} A total, {self.phase})")
+                    if switch_at is None:
+                        switch_at = now + (self.high_time if state_high else self.low_time)
+                else:
+                    self.link.query("*OPC?")   # still there? fails if the PSU restarted
             except COMM_ERRORS as e:
-                log(f"psu: set failed, dropping link: {e}")
+                log(f"psu: comms failed, dropping link: {e}")
                 self.link.close()
-                continue   # retry the connection right away, not after a full half-period
-            wait_s = self.high_time if state_high else self.low_time
-            state_high = not state_high
-            if self._stop.wait(wait_s):
-                break
+                self._mark_down()
+                # Reconnect almost at once (outputs are re-enabled on
+                # reconnect); the pause only stops a PSU that fails straight
+                # after every connect from spinning this loop.
+                self._stop.wait(1)
+                continue
+            except Exception as e:
+                log(f"psu: unexpected {type(e).__name__}: {e}; dropping link")
+                self.link.close()
+                self._mark_down()
+                self._stop.wait(self.RECONNECT_S)
+                continue
+            self._stop.wait(max(0.0, min(self.CHECK_S, switch_at - time.monotonic())))
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
