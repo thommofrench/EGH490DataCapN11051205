@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+# left by the loggers' automatic git repair
+.git-broken/
+.git-repair-tmp/
+.git-repair.lock/

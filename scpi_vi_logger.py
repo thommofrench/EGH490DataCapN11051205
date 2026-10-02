@@ -290,6 +290,12 @@ class GitPusher:
     failures are logged but never raised.
     """
 
+    # Words in git's output that mean the local repo itself is damaged, as
+    # opposed to the network or the remote being the problem.
+    CORRUPT_SIGNS = ("is empty", "corrupt", "could not parse head", "bad object",
+                     "unable to read", "invalid sha1 pointer", "loose object")
+    REPAIR_GAP_S = 600   # at most one repair attempt per this many seconds
+
     def __init__(self, repo_dir, file_path, interval, branch, enabled):
         self.repo_dir = repo_dir
         self.rel_path = os.path.relpath(file_path, repo_dir)
@@ -298,8 +304,12 @@ class GitPusher:
         self.enabled = enabled
         self._stop = threading.Event()
         self._thread = None
+        self._last_repair = None
+        # Read by the main thread's hourly status line.
+        self.started = time.monotonic()
+        self.last_ok = None
 
-    def _git(self, *args):
+    def _git(self, *args, cwd=None):
         """Run one git command, killed if it runs past GIT_TIMEOUT.
 
         Without a timeout, one push that hangs on a dead WiFi link would block
@@ -308,9 +318,15 @@ class GitPusher:
         core.fsync makes git flush each object and ref to disk as it writes
         it. Without it, a power cut on the Pi left a pushed commit as an empty
         file in the local repo, and every commit after that failed.
+
+        Every commit stores a whole new copy of the CSV, and by default git
+        only packs them (as small deltas) once ~6700 loose objects pile up -
+        gigabytes of SD card by week three. gc.auto=256 packs every few hours
+        instead, single-threaded to keep the Pi's memory free.
         """
         p = subprocess.Popen(
-            ["git", "-c", "core.fsync=all", *args], cwd=self.repo_dir,
+            ["git", "-c", "core.fsync=all", "-c", "gc.auto=256", "-c", "pack.threads=1",
+             *args], cwd=cwd or self.repo_dir,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
             # Own process group, so a timeout can kill git's ssh child too.
@@ -373,29 +389,139 @@ class GitPusher:
     def _push_once(self):
         try:
             self._clear_stale_locks()
-            add = self._git_retry("add", self.rel_path)
-            if add.returncode != 0:
-                log(f"git add failed: {add.stderr.strip()}")
-                return
-            commit = self._git_retry(
-                "commit", "-m",
-                f"data update {datetime.datetime.now().isoformat(timespec='seconds')}",
-            )
-            # "nothing to commit" still falls through to the push: the other
-            # logger process may have committed our rows in its own commit, or
-            # an earlier push may have failed, leaving local commits unpushed.
-            out = (commit.stdout + commit.stderr).lower()
-            if commit.returncode != 0 and \
-                    "nothing to commit" not in out and "nothing added to commit" not in out:
-                log(f"git commit failed: {commit.stdout.strip()} {commit.stderr.strip()}")
-                return
-            push = self._git_retry("push", "origin", self.branch)
-            if push.returncode != 0:
-                log(f"git push failed: {push.stderr.strip()}")
-            else:
-                log("git push ok")
+            failed = self._sync()
+            if failed is not None and self._looks_corrupt(failed) and self._repair():
+                failed = self._sync()   # repaired: don't wait a whole interval
+            if failed is None:
+                self.last_ok = time.monotonic()
         except Exception as e:
             log(f"git sync error: {e}")
+
+    def _sync(self):
+        """add, commit, push. Returns None on success, else the failed git
+        result (already logged)."""
+        add = self._git_retry("add", self.rel_path)
+        if add.returncode != 0:
+            log(f"git add failed: {add.stderr.strip()}")
+            return add
+        commit = self._git_retry(
+            "commit", "-m",
+            f"data update {datetime.datetime.now().isoformat(timespec='seconds')}",
+        )
+        # "nothing to commit" still falls through to the push: the other
+        # logger process may have committed our rows in its own commit, or
+        # an earlier push may have failed, leaving local commits unpushed.
+        out = (commit.stdout + commit.stderr).lower()
+        if commit.returncode != 0 and \
+                "nothing to commit" not in out and "nothing added to commit" not in out:
+            log(f"git commit failed: {commit.stdout.strip()} {commit.stderr.strip()}")
+            return commit
+        push = self._git_retry("push", "origin", self.branch)
+        if push.returncode != 0 and ("fetch first" in push.stderr
+                                     or "non-fast-forward" in push.stderr):
+            if self._merge_remote():
+                push = self._git_retry("push", "origin", self.branch)
+        if push.returncode != 0:
+            log(f"git push failed: {push.stderr.strip()}")
+            return push
+        log("git push ok")
+        return None
+
+    def _looks_corrupt(self, result):
+        out = (result.stdout + result.stderr).lower()
+        return any(s in out for s in self.CORRUPT_SIGNS) and not self._repo_ok()
+
+    def _repo_ok(self):
+        """Can git read what every commit needs: HEAD's commit and tree, and
+        the index?"""
+        return all(self._git(*a).returncode == 0 for a in (
+            ("cat-file", "-p", "HEAD"), ("ls-tree", "HEAD"), ("status", "--porcelain", "-uno")))
+
+    def _repair(self):
+        """Replace a damaged .git with a fresh copy of origin's history.
+
+        Only .git is swapped; the working tree, and with it the CSVs the
+        loggers hold open, is never touched. Rows that were committed locally
+        but never pushed are still in those CSVs, so the next commit after
+        the repair picks them up and nothing is lost. The damaged copy is
+        kept as .git-broken until the next repair, for a look by hand.
+        """
+        now = time.monotonic()
+        if self._last_repair is not None and now - self._last_repair < self.REPAIR_GAP_S:
+            return False
+        self._last_repair = now
+        repo, git_dir = self.repo_dir, os.path.join(self.repo_dir, ".git")
+        # Both loggers share the repo; only one may repair it at a time.
+        lock = os.path.join(repo, ".git-repair.lock")
+        try:
+            os.mkdir(lock)
+        except FileExistsError:
+            if time.time() - os.path.getmtime(lock) < 1800:
+                log("git: repo damaged; the other logger is already repairing it")
+                return False
+            os.utime(lock)   # left by a repair that died; take it over
+        try:
+            if self._repo_ok():
+                return True   # the other logger repaired it just now
+            url = self._git("config", "--get", "remote.origin.url").stdout.strip()
+            log(f"git: local repo is damaged, re-downloading its history from {url}")
+            tmp = os.path.join(repo, ".git-repair-tmp")
+            shutil.rmtree(tmp, ignore_errors=True)
+            clone = self._git("clone", "--bare", "--quiet", url, tmp,
+                              cwd=os.path.dirname(os.path.abspath(repo)))
+            if clone.returncode != 0:
+                log(f"git repair: clone failed, will retry later: {clone.stderr.strip()}")
+                shutil.rmtree(tmp, ignore_errors=True)
+                return False
+            # Keep this repo's own settings (remote, identity, branch tracking).
+            try:
+                shutil.copyfile(os.path.join(git_dir, "config"), os.path.join(tmp, "config"))
+            except OSError:
+                pass
+            broken = os.path.join(repo, ".git-broken")
+            shutil.rmtree(broken, ignore_errors=True)
+            os.rename(git_dir, broken)
+            os.rename(tmp, git_dir)
+            self._git("config", "core.bare", "false")
+            self._git("config", "remote.origin.url", url)
+            reset = self._git("reset", "--quiet")   # rebuild the index; working tree untouched
+            ok = reset.returncode == 0 and self._repo_ok()
+            log("git repair: done, damaged copy kept in .git-broken" if ok else
+                f"git repair: FAILED after swap: {reset.stderr.strip()}")
+            return ok
+        finally:
+            shutil.rmtree(lock, ignore_errors=True)
+
+    def _merge_remote(self):
+        """Bring in commits pushed from elsewhere (e.g. code from the laptop)
+        so our push isn't rejected for being behind. Returns True if merged.
+
+        Merge, never rebase: a rebase rewrites the CSVs in the working tree,
+        replacing the file a logger is still appending to, so its later rows
+        would land in a deleted file. A merge leaves alone every file the
+        incoming commits don't change, so it's only done when none of them
+        touch a CSV. Merged code takes effect on the next service restart.
+        """
+        fetch = self._git_retry("fetch", "origin", self.branch)
+        if fetch.returncode != 0:
+            log(f"git fetch failed: {fetch.stderr.strip()}")
+            return False
+        upstream = f"origin/{self.branch}"
+        changed = self._git("diff", "--name-only", f"HEAD...{upstream}").stdout.split()
+        data = [f for f in changed if f.endswith(".csv")]
+        if data:
+            log(f"git: NOT merging {upstream}, it changes data files {data}; "
+                f"pushes will keep failing until this is merged by hand")
+            return False
+        n = self._git("rev-list", "--count", f"HEAD..{upstream}").stdout.strip()
+        merge = self._git_retry("merge", "--no-edit", upstream)
+        if merge.returncode != 0:
+            self._git("merge", "--abort")
+            log(f"git merge of {upstream} failed: {merge.stdout.strip()} {merge.stderr.strip()}")
+            return False
+        log(f"git: merged {n} new commit(s) from {upstream} "
+            f"({', '.join(changed) or 'no file changes'}); new code runs after a restart")
+        return True
 
     def _run(self):
         while not self._stop.wait(self.interval):
@@ -452,7 +578,19 @@ class PsuWaveform:
     current phase, and only then are the channel outputs switched on, so the
     output never comes up at a stale setpoint. Outputs are switched off again
     on a clean shutdown (a hard kill can't do this).
+
+    Between phase changes the PSU is pinged every CHECK_S. A PSU that was
+    power-cycled comes back with its outputs off and its old USB session
+    dead, so the ping fails, the link is rebuilt and the outputs re-enabled
+    within seconds rather than at the next phase change. A front-panel
+    Output-off is left alone: the USB link survives that, so it's never
+    mistaken for a restart. While the link is down the CSV's psu_phase reads
+    "psu_down" and the target is blank, so the data never claims a current
+    the PSU isn't being told to deliver.
     """
+
+    CHECK_S = 5.0       # ping interval between phase changes
+    RECONNECT_S = 10.0  # wait between failed connection attempts
 
     def __init__(self, resource, backend, timeout_ms, channels,
                  peak_current, mod_depth, period_s, duty, voltage):
@@ -466,7 +604,7 @@ class PsuWaveform:
         # --psu-mod-depth 0 gives a flat DC setpoint (the baseline run). The
         # loop still re-applies it every half period, which harmlessly
         # re-asserts the setpoint, but the phase is logged as "dc" rather than
-        # a meaningless high/low alternation.
+        # a meaningless high/low alternation. "psu_down" while disconnected.
         self.dc = mod_depth == 0
         self._stop = threading.Event()
         self._thread = None
@@ -522,33 +660,57 @@ class PsuWaveform:
             self.link.close()
             return False
 
+    def _mark_down(self):
+        self.phase = "psu_down"
+        self.target_total_A = None
+
     def _run(self):
         state_high = True
+        switch_at = None   # monotonic time of the next phase change; None = set it now
         while not self._stop.is_set():
-            if not self._ensure_connected():
-                if self._stop.wait(10):
-                    break
-                continue
-            level = self.high if state_high else self.low
+            # Nothing may escape this loop: a dead thread would leave the PSU
+            # uncontrolled for the rest of the run while DMM logging carried on.
             try:
-                self._apply(level)
-                if self._needs_enable:
-                    # Voltage went in on connect, current just now; safe to enable.
-                    self._set_outputs(True)
-                    self._needs_enable = False
-                total = level * len(self.channels)
-                self.phase = "dc" if self.dc else ("high" if state_high else "low")
-                self.target_total_A = total
-                log(f"psu waveform: {level:.3f} A/ch "
-                    f"({total:.3f} A total, {self.phase})")
+                if not self._ensure_connected():
+                    self._mark_down()
+                    self._stop.wait(self.RECONNECT_S)
+                    continue
+                now = time.monotonic()
+                if switch_at is not None and now >= switch_at:
+                    state_high = not state_high
+                    switch_at = None
+                if switch_at is None or self._needs_enable:
+                    level = self.high if state_high else self.low
+                    self._apply(level)
+                    if self._needs_enable:
+                        # Voltage went in on connect, current just now; safe to enable.
+                        self._set_outputs(True)
+                        self._needs_enable = False
+                    total = level * len(self.channels)
+                    self.phase = "dc" if self.dc else ("high" if state_high else "low")
+                    self.target_total_A = total
+                    log(f"psu waveform: {level:.3f} A/ch "
+                        f"({total:.3f} A total, {self.phase})")
+                    if switch_at is None:
+                        switch_at = now + (self.high_time if state_high else self.low_time)
+                else:
+                    self.link.query("*OPC?")   # still there? fails if the PSU restarted
             except COMM_ERRORS as e:
-                log(f"psu: set failed, dropping link: {e}")
+                log(f"psu: comms failed, dropping link: {e}")
                 self.link.close()
-                continue   # retry the connection right away, not after a full half-period
-            wait_s = self.high_time if state_high else self.low_time
-            state_high = not state_high
-            if self._stop.wait(wait_s):
-                break
+                self._mark_down()
+                # Reconnect almost at once (outputs are re-enabled on
+                # reconnect); the pause only stops a PSU that fails straight
+                # after every connect from spinning this loop.
+                self._stop.wait(1)
+                continue
+            except Exception as e:
+                log(f"psu: unexpected {type(e).__name__}: {e}; dropping link")
+                self.link.close()
+                self._mark_down()
+                self._stop.wait(self.RECONNECT_S)
+                continue
+            self._stop.wait(max(0.0, min(self.CHECK_S, switch_at - time.monotonic())))
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -827,6 +989,13 @@ def main():
                         log(f"instrument error queue: {e}")
                 log(f"uptime {(time.monotonic() - t0) / 3600:.1f} h  "
                     f"rows {written}  gaps {gaps}  reconnects {reconnects}")
+                if pusher.enabled:
+                    mins = (time.monotonic() - (pusher.last_ok or pusher.started)) / 60
+                    if mins > 3 * args.git_interval / 60:
+                        log(f"WARNING: no successful git push for {mins:.0f} min; "
+                            f"data is safe in the CSV but not reaching GitHub")
+                    elif pusher.last_ok is not None:
+                        log(f"git: last push ok {mins:.0f} min ago")
 
             # -- schedule the next slot ------------------------------------
             # Anchored to t0 so it never drifts, and skips missed slots
