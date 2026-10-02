@@ -295,6 +295,7 @@ class GitPusher:
     CORRUPT_SIGNS = ("is empty", "corrupt", "could not parse head", "bad object",
                      "unable to read", "invalid sha1 pointer", "loose object")
     REPAIR_GAP_S = 600   # at most one repair attempt per this many seconds
+    FIRST_PUSH_S = 60.0  # first push this long after start, then every interval
 
     def __init__(self, repo_dir, file_path, interval, branch, enabled):
         self.repo_dir = repo_dir
@@ -524,8 +525,13 @@ class GitPusher:
         return True
 
     def _run(self):
-        while not self._stop.wait(self.interval):
+        # First push soon after starting rather than a whole interval in:
+        # after a power cut this uploads the rows logged since the last push
+        # before the cut, and shows on GitHub that the run is back.
+        wait = min(self.FIRST_PUSH_S, self.interval)
+        while not self._stop.wait(wait):
             self._push_once()
+            wait = self.interval
         self._push_once()   # final push on shutdown so the last rows land
 
     def start(self):
