@@ -290,6 +290,12 @@ class GitPusher:
     failures are logged but never raised.
     """
 
+    # Words in git's output that mean the local repo itself is damaged, as
+    # opposed to the network or the remote being the problem.
+    CORRUPT_SIGNS = ("is empty", "corrupt", "could not parse head", "bad object",
+                     "unable to read", "invalid sha1 pointer", "loose object")
+    REPAIR_GAP_S = 600   # at most one repair attempt per this many seconds
+
     def __init__(self, repo_dir, file_path, interval, branch, enabled):
         self.repo_dir = repo_dir
         self.rel_path = os.path.relpath(file_path, repo_dir)
@@ -298,8 +304,12 @@ class GitPusher:
         self.enabled = enabled
         self._stop = threading.Event()
         self._thread = None
+        self._last_repair = None
+        # Read by the main thread's hourly status line.
+        self.started = time.monotonic()
+        self.last_ok = None
 
-    def _git(self, *args):
+    def _git(self, *args, cwd=None):
         """Run one git command, killed if it runs past GIT_TIMEOUT.
 
         Without a timeout, one push that hangs on a dead WiFi link would block
@@ -308,9 +318,15 @@ class GitPusher:
         core.fsync makes git flush each object and ref to disk as it writes
         it. Without it, a power cut on the Pi left a pushed commit as an empty
         file in the local repo, and every commit after that failed.
+
+        Every commit stores a whole new copy of the CSV, and by default git
+        only packs them (as small deltas) once ~6700 loose objects pile up -
+        gigabytes of SD card by week three. gc.auto=256 packs every few hours
+        instead, single-threaded to keep the Pi's memory free.
         """
         p = subprocess.Popen(
-            ["git", "-c", "core.fsync=all", *args], cwd=self.repo_dir,
+            ["git", "-c", "core.fsync=all", "-c", "gc.auto=256", "-c", "pack.threads=1",
+             *args], cwd=cwd or self.repo_dir,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
             # Own process group, so a timeout can kill git's ssh child too.
@@ -373,33 +389,108 @@ class GitPusher:
     def _push_once(self):
         try:
             self._clear_stale_locks()
-            add = self._git_retry("add", self.rel_path)
-            if add.returncode != 0:
-                log(f"git add failed: {add.stderr.strip()}")
-                return
-            commit = self._git_retry(
-                "commit", "-m",
-                f"data update {datetime.datetime.now().isoformat(timespec='seconds')}",
-            )
-            # "nothing to commit" still falls through to the push: the other
-            # logger process may have committed our rows in its own commit, or
-            # an earlier push may have failed, leaving local commits unpushed.
-            out = (commit.stdout + commit.stderr).lower()
-            if commit.returncode != 0 and \
-                    "nothing to commit" not in out and "nothing added to commit" not in out:
-                log(f"git commit failed: {commit.stdout.strip()} {commit.stderr.strip()}")
-                return
-            push = self._git_retry("push", "origin", self.branch)
-            if push.returncode != 0 and ("fetch first" in push.stderr
-                                         or "non-fast-forward" in push.stderr):
-                if self._merge_remote():
-                    push = self._git_retry("push", "origin", self.branch)
-            if push.returncode != 0:
-                log(f"git push failed: {push.stderr.strip()}")
-            else:
-                log("git push ok")
+            failed = self._sync()
+            if failed is not None and self._looks_corrupt(failed) and self._repair():
+                failed = self._sync()   # repaired: don't wait a whole interval
+            if failed is None:
+                self.last_ok = time.monotonic()
         except Exception as e:
             log(f"git sync error: {e}")
+
+    def _sync(self):
+        """add, commit, push. Returns None on success, else the failed git
+        result (already logged)."""
+        add = self._git_retry("add", self.rel_path)
+        if add.returncode != 0:
+            log(f"git add failed: {add.stderr.strip()}")
+            return add
+        commit = self._git_retry(
+            "commit", "-m",
+            f"data update {datetime.datetime.now().isoformat(timespec='seconds')}",
+        )
+        # "nothing to commit" still falls through to the push: the other
+        # logger process may have committed our rows in its own commit, or
+        # an earlier push may have failed, leaving local commits unpushed.
+        out = (commit.stdout + commit.stderr).lower()
+        if commit.returncode != 0 and \
+                "nothing to commit" not in out and "nothing added to commit" not in out:
+            log(f"git commit failed: {commit.stdout.strip()} {commit.stderr.strip()}")
+            return commit
+        push = self._git_retry("push", "origin", self.branch)
+        if push.returncode != 0 and ("fetch first" in push.stderr
+                                     or "non-fast-forward" in push.stderr):
+            if self._merge_remote():
+                push = self._git_retry("push", "origin", self.branch)
+        if push.returncode != 0:
+            log(f"git push failed: {push.stderr.strip()}")
+            return push
+        log("git push ok")
+        return None
+
+    def _looks_corrupt(self, result):
+        out = (result.stdout + result.stderr).lower()
+        return any(s in out for s in self.CORRUPT_SIGNS) and not self._repo_ok()
+
+    def _repo_ok(self):
+        """Can git read what every commit needs: HEAD's commit and tree, and
+        the index?"""
+        return all(self._git(*a).returncode == 0 for a in (
+            ("cat-file", "-p", "HEAD"), ("ls-tree", "HEAD"), ("status", "--porcelain", "-uno")))
+
+    def _repair(self):
+        """Replace a damaged .git with a fresh copy of origin's history.
+
+        Only .git is swapped; the working tree, and with it the CSVs the
+        loggers hold open, is never touched. Rows that were committed locally
+        but never pushed are still in those CSVs, so the next commit after
+        the repair picks them up and nothing is lost. The damaged copy is
+        kept as .git-broken until the next repair, for a look by hand.
+        """
+        now = time.monotonic()
+        if self._last_repair is not None and now - self._last_repair < self.REPAIR_GAP_S:
+            return False
+        self._last_repair = now
+        repo, git_dir = self.repo_dir, os.path.join(self.repo_dir, ".git")
+        # Both loggers share the repo; only one may repair it at a time.
+        lock = os.path.join(repo, ".git-repair.lock")
+        try:
+            os.mkdir(lock)
+        except FileExistsError:
+            if time.time() - os.path.getmtime(lock) < 1800:
+                log("git: repo damaged; the other logger is already repairing it")
+                return False
+            os.utime(lock)   # left by a repair that died; take it over
+        try:
+            if self._repo_ok():
+                return True   # the other logger repaired it just now
+            url = self._git("config", "--get", "remote.origin.url").stdout.strip()
+            log(f"git: local repo is damaged, re-downloading its history from {url}")
+            tmp = os.path.join(repo, ".git-repair-tmp")
+            shutil.rmtree(tmp, ignore_errors=True)
+            clone = self._git("clone", "--bare", "--quiet", url, tmp,
+                              cwd=os.path.dirname(os.path.abspath(repo)))
+            if clone.returncode != 0:
+                log(f"git repair: clone failed, will retry later: {clone.stderr.strip()}")
+                shutil.rmtree(tmp, ignore_errors=True)
+                return False
+            # Keep this repo's own settings (remote, identity, branch tracking).
+            try:
+                shutil.copyfile(os.path.join(git_dir, "config"), os.path.join(tmp, "config"))
+            except OSError:
+                pass
+            broken = os.path.join(repo, ".git-broken")
+            shutil.rmtree(broken, ignore_errors=True)
+            os.rename(git_dir, broken)
+            os.rename(tmp, git_dir)
+            self._git("config", "core.bare", "false")
+            self._git("config", "remote.origin.url", url)
+            reset = self._git("reset", "--quiet")   # rebuild the index; working tree untouched
+            ok = reset.returncode == 0 and self._repo_ok()
+            log("git repair: done, damaged copy kept in .git-broken" if ok else
+                f"git repair: FAILED after swap: {reset.stderr.strip()}")
+            return ok
+        finally:
+            shutil.rmtree(lock, ignore_errors=True)
 
     def _merge_remote(self):
         """Bring in commits pushed from elsewhere (e.g. code from the laptop)
@@ -898,6 +989,13 @@ def main():
                         log(f"instrument error queue: {e}")
                 log(f"uptime {(time.monotonic() - t0) / 3600:.1f} h  "
                     f"rows {written}  gaps {gaps}  reconnects {reconnects}")
+                if pusher.enabled:
+                    mins = (time.monotonic() - (pusher.last_ok or pusher.started)) / 60
+                    if mins > 3 * args.git_interval / 60:
+                        log(f"WARNING: no successful git push for {mins:.0f} min; "
+                            f"data is safe in the CSV but not reaching GitHub")
+                    elif pusher.last_ok is not None:
+                        log(f"git: last push ok {mins:.0f} min ago")
 
             # -- schedule the next slot ------------------------------------
             # Anchored to t0 so it never drifts, and skips missed slots
