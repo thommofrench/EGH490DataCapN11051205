@@ -390,12 +390,47 @@ class GitPusher:
                 log(f"git commit failed: {commit.stdout.strip()} {commit.stderr.strip()}")
                 return
             push = self._git_retry("push", "origin", self.branch)
+            if push.returncode != 0 and ("fetch first" in push.stderr
+                                         or "non-fast-forward" in push.stderr):
+                if self._merge_remote():
+                    push = self._git_retry("push", "origin", self.branch)
             if push.returncode != 0:
                 log(f"git push failed: {push.stderr.strip()}")
             else:
                 log("git push ok")
         except Exception as e:
             log(f"git sync error: {e}")
+
+    def _merge_remote(self):
+        """Bring in commits pushed from elsewhere (e.g. code from the laptop)
+        so our push isn't rejected for being behind. Returns True if merged.
+
+        Merge, never rebase: a rebase rewrites the CSVs in the working tree,
+        replacing the file a logger is still appending to, so its later rows
+        would land in a deleted file. A merge leaves alone every file the
+        incoming commits don't change, so it's only done when none of them
+        touch a CSV. Merged code takes effect on the next service restart.
+        """
+        fetch = self._git_retry("fetch", "origin", self.branch)
+        if fetch.returncode != 0:
+            log(f"git fetch failed: {fetch.stderr.strip()}")
+            return False
+        upstream = f"origin/{self.branch}"
+        changed = self._git("diff", "--name-only", f"HEAD...{upstream}").stdout.split()
+        data = [f for f in changed if f.endswith(".csv")]
+        if data:
+            log(f"git: NOT merging {upstream}, it changes data files {data}; "
+                f"pushes will keep failing until this is merged by hand")
+            return False
+        n = self._git("rev-list", "--count", f"HEAD..{upstream}").stdout.strip()
+        merge = self._git_retry("merge", "--no-edit", upstream)
+        if merge.returncode != 0:
+            self._git("merge", "--abort")
+            log(f"git merge of {upstream} failed: {merge.stdout.strip()} {merge.stderr.strip()}")
+            return False
+        log(f"git: merged {n} new commit(s) from {upstream} "
+            f"({', '.join(changed) or 'no file changes'}); new code runs after a restart")
+        return True
 
     def _run(self):
         while not self._stop.wait(self.interval):
