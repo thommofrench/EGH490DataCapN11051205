@@ -16,7 +16,7 @@ ExecStart=/home/thomas/datacap-venv/bin/python3 scpi_vi_logger_usb.py --backend 
     -r USB0::0x0AAD::0x0135::000100194::INSTR \
     --psu-resource USB0::0x0AAD::0x0197::5601.3800k03-113353::0::INSTR \
     --psu-peak-current 5 --psu-voltage 2 --psu-mod-depth 0 \
-    -o dummy_test7_PI_USB_DC_baseline_power_log.csv
+    -o prelim_test1_PI_USB_DC_baseline_power_log.csv
 Restart=on-failure
 RestartSec=10
 KillMode=mixed
