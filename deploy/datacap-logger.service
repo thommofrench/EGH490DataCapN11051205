@@ -1,5 +1,5 @@
 [Unit]
-Description=DataCap DMM/PSU USB logger
+Description=DataCap cell + Hall voltage logger (two DMMs, AC waveform PSU)
 After=network-online.target
 Wants=network-online.target
 

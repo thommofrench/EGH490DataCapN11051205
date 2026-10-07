@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Long-run voltage/current logger for Rohde & Schwarz instruments (PyVISA).
+Long-run voltage logger for Rohde & Schwarz instruments (PyVISA).
+
+Two DMMs read DC voltage only - the cell voltage and the Hall voltage - into
+one CSV, while an NGE103B PSU drives a square-wave current through the cell.
+Each DMM has its own link, so either can drop out without stopping the other.
 
 Built to survive unattended multi-week runs: it reconnects on its own, detects
 the VISA desync that silently corrupts readings after a timeout, appends rather
@@ -11,11 +15,11 @@ Install:
     pip install pyvisa pyvisa-py
 
 Self-test with no hardware (recommended before any long run):
-    python scpi_vi_logger.py --simulate --interval 1 --hours 0.02 -c 1 2
+    python scpi_vi_logger.py --simulate --no-psu --interval 1 --hours 0.02
 
 Real use:
     python scpi_vi_logger.py --list
-    python scpi_vi_logger.py -r TCPIP0::10.68.63.118::5025::SOCKET -c 1 2
+    python scpi_vi_logger.py --cell-resource USB0::... --hall-resource USB0::...
 
 Every --git-interval seconds (default 300 = 5 min) the CSV is committed and
 pushed to the 'origin' remote of the git repo containing it, so a remote
@@ -51,10 +55,11 @@ import pyvisa
 # so running it via a shortcut or from a different directory still writes
 # into - and pushes from - the right place.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-RESOURCE = "TCPIP0::10.68.63.118::5025::SOCKET"
+# The two UDS500 DMMs, both on USB and both reading DC voltage only.
+CELL_RESOURCE = "USB0::0x0AAD::0x0135::000100196::INSTR"
+HALL_RESOURCE = "USB0::0x0AAD::0x0135::000100194::INSTR"
 INTERVAL = 30.0
-CHANNELS = [1]
-OUTFILE = os.path.join(SCRIPT_DIR, "prelim_test1_PI_USB_AC_test_power_log.csv")
+OUTFILE = os.path.join(SCRIPT_DIR, "prelim_test2_PI_USB_cell_hall_voltage_log.csv")
 TIMEOUT_MS = 5000
 GIT_INTERVAL = 300.0   # commit + push the CSV this often
 GIT_TIMEOUT = 90.0     # kill any single git command that runs longer than this
@@ -146,12 +151,14 @@ class Link:
         self.idn = self.inst.query("*IDN?").strip()
 
     def close(self):
-        for obj in (self.inst, self.rm):
-            try:
-                if obj is not None:
-                    obj.close()
-            except Exception:
-                pass
+        # Close only this instrument's session, never self.rm: pyvisa shares
+        # one resource manager per VISA library, and closing it would also
+        # kill the other DMM's (and the PSU's) session.
+        try:
+            if self.inst is not None:
+                self.inst.close()
+        except Exception:
+            pass
         self.inst = None
         self.rm = None
 
@@ -187,40 +194,74 @@ def parse_reading(text):
     return v
 
 
-def read_channel(link, ch, multichannel):
-    """Return (volts, amps) for one channel.
+def read_voltage(link):
+    """One fresh DC voltage reading.
 
-    MEAS: matters. A bare VOLT? gives the setpoint you programmed, not what
-    the output is actually doing.
-
-    Current is read first and voltage last on purpose: each MEAS: query
-    switches the meter's measurement mode, and the mode left active between
-    samples loads the circuit. Ending on voltage leaves the meter in its
-    high-impedance mode instead of the low-impedance current mode, so the
-    idle meter doesn't disturb the source under test.
+    Voltage is the only mode the meters are ever put in, so they stay in
+    high-impedance mode and never load the circuit under test.
     """
-    if multichannel:
-        link.write(f"INST:NSEL {ch}")
-        # Confirm the switch landed. Over hundreds of hours a dropped command
-        # would otherwise file channel 2's readings under channel 1.
-        got = link.query("INST:NSEL?")
-        if int(float(got)) != ch:
-            raise IOError(f"channel select failed: asked {ch}, got {got}")
-    i = parse_reading(link.query("MEAS:CURR?"))
-    v = parse_reading(link.query("MEAS:VOLT?"))
-    return v, i
+    return parse_reading(link.query("MEAS:VOLT?"))
 
 
-def sample_all(link, channels, multichannel):
-    """One full pass. Raises on comms trouble so the caller can reconnect."""
-    out = []
-    for ch in channels:
+def sample(link):
+    """Raises on comms trouble so the caller can reconnect."""
+    try:
+        return read_voltage(link)
+    except COMM_ERRORS:
+        link.resync()          # raises if unrecoverable -> reconnect
+        return read_voltage(link)   # one retry
+
+
+class Meter:
+    """One DMM and its own reconnect bookkeeping, so either meter can drop
+    out and come back without affecting the other's readings."""
+
+    def __init__(self, name, link):
+        self.name = name
+        self.link = link
+        self.outage_since = None
+        self.fail_streak = 0
+        self.reconnects = 0
+
+    def read(self):
+        """Return (status, cell) for this slot; cell is the voltage as text,
+        or blank when there's no reading."""
+        status = "ok"
+        if not self.link.up:
+            try:
+                self.link.open()
+            except Exception as e:
+                self.link.close()
+                if self.outage_since is None:
+                    self.outage_since = time.monotonic()
+                    log(f"{self.name}: link down: {e}")
+                self.fail_streak += 1
+                if self.fail_streak in (5, 20, 100) or self.fail_streak % 500 == 0:
+                    mins = (time.monotonic() - self.outage_since) / 60
+                    log(f"{self.name}: still down after {self.fail_streak} tries ({mins:.0f} min)")
+                return "disconnected", ""
+            status = "reconnected"
+            self.reconnects += 1
+            self.fail_streak = 0
+            down = f" after {time.monotonic() - self.outage_since:.0f}s" if self.outage_since else ""
+            self.outage_since = None
+            log(f"{self.name}: connected{down}: {self.link.idn}")
         try:
-            out.append(read_channel(link, ch, multichannel))
-        except COMM_ERRORS:
-            link.resync()          # raises if unrecoverable -> reconnect
-            out.append(read_channel(link, ch, multichannel))   # one retry
-    return out
+            v = sample(self.link)
+        except Exception as e:
+            log(f"{self.name}: sample failed, dropping link: {e}")
+            self.link.close()
+            self.outage_since = self.outage_since or time.monotonic()
+            return "comms_error", ""
+        self.fail_streak = 0
+        return status, f"{v:.6f}"
+
+
+def combine_status(meters, statuses):
+    """'ok' when both meters agree on it, else e.g. 'cell:ok hall:comms_error'."""
+    if len(set(statuses)) == 1:
+        return statuses[0]
+    return " ".join(f"{m.name}:{s}" for m, s in zip(meters, statuses))
 
 
 def drain_errors(link, limit=20):
@@ -818,10 +859,12 @@ def list_resources(backend):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Long-run V/I logger over PyVISA.")
-    p.add_argument("-r", "--resource", default=RESOURCE)
+    p = argparse.ArgumentParser(description="Long-run cell/Hall voltage logger over PyVISA.")
+    p.add_argument("--cell-resource", default=CELL_RESOURCE,
+                   help="VISA resource of the DMM reading the cell voltage")
+    p.add_argument("--hall-resource", default=HALL_RESOURCE,
+                   help="VISA resource of the DMM reading the Hall voltage")
     p.add_argument("-i", "--interval", type=float, default=INTERVAL)
-    p.add_argument("-c", "--channels", type=int, nargs="+", default=CHANNELS)
     p.add_argument("-o", "--out", default=OUTFILE)
     p.add_argument("--backend", default="@py",
                    help="'@py' for pyvisa-py, '' for installed vendor VISA")
@@ -876,12 +919,9 @@ def main():
     if args.interval <= 0:
         sys.exit("--interval must be positive")
 
-    multichannel = len(args.channels) > 1
     stopper = Stopper()
 
-    header = ["timestamp", "elapsed_s", "status"]
-    for ch in args.channels:
-        header += [f"ch{ch}_voltage_V", f"ch{ch}_current_A", f"ch{ch}_power_W"]
+    header = ["timestamp", "elapsed_s", "status", "Cell Voltage (V)", "Hall Voltage (V)"]
     if args.psu_resource:
         header += ["psu_target_A_total", "psu_phase"]
     sink = CsvSink(args.out, header)
@@ -913,17 +953,13 @@ def main():
             log(f"psu: on connect will set {args.psu_voltage:g} V per channel, "
                 f"then switch outputs on")
 
-    link = Link(args.resource, args.backend, args.timeout, args.simulate)
-    blanks = ["", "", ""] * len(args.channels)
-    if args.psu_resource:
-        blanks = blanks + ["", ""]
+    meters = [Meter("cell", Link(args.cell_resource, args.backend, args.timeout, args.simulate)),
+              Meter("hall", Link(args.hall_resource, args.backend, args.timeout, args.simulate))]
 
     t0 = time.monotonic()
     deadline = t0 + args.hours * 3600 if args.hours else None
     n = 0
-    written = gaps = reconnects = 0
-    outage_since = None
-    fail_streak = 0
+    written = gaps = 0
     last_housekeeping = 0.0
 
     log(f"logging every {args.interval:g}s to {sink.path}")
@@ -937,48 +973,21 @@ def main():
 
             stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
             elapsed = round(time.monotonic() - t0, 1)
-            status = "ok"
 
-            # -- reconnect if we're down ----------------------------------
-            if not link.up:
-                try:
-                    link.open()
-                    status = "reconnected"
-                    reconnects += 1
-                    fail_streak = 0
-                    down = f" after {time.monotonic() - outage_since:.0f}s" if outage_since else ""
-                    outage_since = None
-                    log(f"connected{down}: {link.idn}")
-                except Exception as e:
-                    link.close()
-                    if outage_since is None:
-                        outage_since = time.monotonic()
-                        log(f"link down: {e}")
-                    fail_streak += 1
-                    if fail_streak in (5, 20, 100) or fail_streak % 500 == 0:
-                        mins = (time.monotonic() - outage_since) / 60
-                        log(f"still down after {fail_streak} tries ({mins:.0f} min)")
+            # -- take the sample (each meter reconnects itself if down) ---
+            statuses, cells = [], []
+            for m in meters:
+                s, v = m.read()
+                statuses.append(s)
+                cells.append(v)
+            status = combine_status(meters, statuses)
+            # The PSU runs on its own thread, so its state is logged even
+            # when a meter is down.
+            if psu is not None:
+                target = psu.target_total_A
+                cells += [f"{target:.4f}" if target is not None else "", psu.phase]
 
-            # -- take the sample ------------------------------------------
-            if link.up:
-                try:
-                    readings = sample_all(link, args.channels, multichannel)
-                    cells = []
-                    for v, i in readings:
-                        cells += [f"{v:.6f}", f"{i:.6f}", f"{v * i:.6f}"]
-                    if psu is not None:
-                        target = psu.target_total_A
-                        cells += [f"{target:.4f}" if target is not None else "", psu.phase]
-                    fail_streak = 0
-                except Exception as e:
-                    log(f"sample failed, dropping link: {e}")
-                    link.close()
-                    outage_since = outage_since or time.monotonic()
-                    cells, status = blanks, "comms_error"
-            else:
-                cells, status = blanks, "disconnected"
-
-            if status in ("comms_error", "disconnected"):
+            if any(s in ("comms_error", "disconnected") for s in statuses):
                 gaps += 1
             if sink.write([stamp, elapsed, status] + cells):
                 written += 1
@@ -990,11 +999,13 @@ def main():
                 free = sink.free_bytes()
                 if free is not None and free < DISK_WARN_BYTES:
                     log(f"LOW DISK: {free / 1e6:.0f} MB free")
-                if link.up:
-                    for e in drain_errors(link):
-                        log(f"instrument error queue: {e}")
+                for m in meters:
+                    if m.link.up:
+                        for e in drain_errors(m.link):
+                            log(f"{m.name}: instrument error queue: {e}")
                 log(f"uptime {(time.monotonic() - t0) / 3600:.1f} h  "
-                    f"rows {written}  gaps {gaps}  reconnects {reconnects}")
+                    f"rows {written}  gaps {gaps}  reconnects "
+                    + "  ".join(f"{m.name} {m.reconnects}" for m in meters))
                 if pusher.enabled:
                     mins = (time.monotonic() - (pusher.last_ok or pusher.started)) / 60
                     if mins > 3 * args.git_interval / 60:
@@ -1019,13 +1030,14 @@ def main():
         return 1
     finally:
         sink.close()
-        link.close()
+        for m in meters:
+            m.link.close()
         if psu is not None:
             psu.stop()
         pusher.stop()
         hours = (time.monotonic() - t0) / 3600
-        log(f"stopped after {hours:.2f} h - {written} rows "
-            f"({gaps} gaps, {reconnects} reconnects) in {sink.path}")
+        log(f"stopped after {hours:.2f} h - {written} rows ({gaps} gaps, reconnects "
+            + ", ".join(f"{m.name} {m.reconnects}" for m in meters) + f") in {sink.path}")
     return 0
 
 
