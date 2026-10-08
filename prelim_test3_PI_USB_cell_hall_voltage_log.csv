@@ -1,0 +1,4 @@
+timestamp,elapsed_s,status,Cell Voltage (V),Hall Voltage (V),psu_target_A_total,psu_phase
+2026-10-08T11:56:52+10:00,0.0,reconnected,1.389360,0.024256,5.0000,high
+2026-10-08T11:57:22+10:00,30.0,ok,1.964380,-5.074900,5.0000,high
+2026-10-08T11:57:52+10:00,60.0,ok,1.960670,-5.077800,5.0000,high
