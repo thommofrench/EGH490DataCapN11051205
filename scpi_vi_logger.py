@@ -895,10 +895,10 @@ def main():
                         "needed for USB; '@py' for pyvisa-py)")
     p.add_argument("--psu-channels", type=int, nargs="+", default=[1, 2],
                    help="PSU channels wired in parallel and driven together")
-    p.add_argument("--psu-voltage", type=float, default=2,
+    p.add_argument("--psu-voltage", type=float, default=2.2,
                    help="voltage set on each PSU channel at startup/reconnect "
                         "(the shared CV ceiling for parallel-wired channels), "
-                        "default 2 V.")
+                        "default 2.2 V.")
     p.add_argument("--psu-peak-current", type=float, default=5.0,
                    help="TOTAL peak current across all --psu-channels combined, in amps")
     p.add_argument("--psu-mod-depth", type=float, default=0.8,
