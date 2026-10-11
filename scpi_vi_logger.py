@@ -3,7 +3,8 @@
 Long-run voltage logger for Rohde & Schwarz instruments (PyVISA).
 
 Two DMMs read DC voltage only - the cell voltage and the Hall voltage - into
-one CSV, while an NGE103B PSU drives a square-wave current through the cell.
+one CSV, while an NGE103B PSU drives a square-wave current through the cell
+(the AC test) or, with --dc, a constant current (the DC test).
 Each DMM has its own link, so either can drop out without stopping the other.
 
 Built to survive unattended multi-week runs: it reconnects on its own, detects
@@ -59,7 +60,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CELL_RESOURCE = "USB0::0x0AAD::0x0135::000100196::INSTR"
 HALL_RESOURCE = "USB0::0x0AAD::0x0135::000100194::INSTR"
 INTERVAL = 30.0
-OUTFILE = os.path.join(SCRIPT_DIR, "prelim_test3_PI_USB_cell_hall_voltage_log.csv")
+# The CSV is named from this and the run type, e.g.
+# prelim_test4_PI_USB_DC_cell_hall_voltage_log.csv; -o overrides it.
+TEST_NAME = "prelim_test4"
 TIMEOUT_MS = 5000
 GIT_INTERVAL = 300.0   # commit + push the CSV this often
 GIT_TIMEOUT = 90.0     # kill any single git command that runs longer than this
@@ -865,7 +868,12 @@ def main():
     p.add_argument("--hall-resource", default=HALL_RESOURCE,
                    help="VISA resource of the DMM reading the Hall voltage")
     p.add_argument("-i", "--interval", type=float, default=INTERVAL)
-    p.add_argument("-o", "--out", default=OUTFILE)
+    p.add_argument("-o", "--out", default=None,
+                   help=f"CSV path (default: {TEST_NAME}_PI_USB_<AC|DC>_cell_hall_voltage_log.csv "
+                        "in the script's folder)")
+    p.add_argument("--dc", action="store_true",
+                   help="DC test: hold the PSU at a constant --psu-peak-current "
+                        "(same as --psu-mod-depth 0) and log to the DC CSV")
     p.add_argument("--backend", default="@py",
                    help="'@py' for pyvisa-py, '' for installed vendor VISA")
     p.add_argument("--timeout", type=int, default=TIMEOUT_MS, help="VISA ms")
@@ -909,6 +917,11 @@ def main():
     p.add_argument("--psu-duty", type=float, default=0.5,
                    help="fraction of the period spent at the high (peak) level")
     args = p.parse_args()
+    if args.dc:
+        args.psu_mod_depth = 0.0
+    if args.out is None:
+        run = "DC" if args.dc or args.psu_mod_depth == 0 else "AC"
+        args.out = os.path.join(SCRIPT_DIR, f"{TEST_NAME}_PI_USB_{run}_cell_hall_voltage_log.csv")
     if args.no_psu:
         args.psu_resource = None
 

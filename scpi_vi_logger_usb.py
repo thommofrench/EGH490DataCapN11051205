@@ -8,7 +8,8 @@ clean shutdown. This file only changes how the DMMs are reached, so a fix made
 in scpi_vi_logger.py applies to both.
 
 Same command line as scpi_vi_logger.py:
-    python scpi_vi_logger_usb.py                 # both DMMs + PSU on USB
+    python scpi_vi_logger_usb.py                 # AC test: both DMMs + square-wave PSU
+    python scpi_vi_logger_usb.py --dc            # DC test: both DMMs + constant-current PSU
     python scpi_vi_logger_usb.py --no-psu        # DMMs only
     python scpi_vi_logger_usb.py --list          # show connected USB instruments
     python scpi_vi_logger_usb.py --cell-resource USB0::... --hall-resource USB0::...
