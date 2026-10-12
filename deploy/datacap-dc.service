@@ -2,8 +2,9 @@
 Description=DataCap DC test logger (two DMMs, constant-current PSU)
 After=network-online.target
 Wants=network-online.target
-# Same DMMs and PSU as the AC test (datacap-logger.service), so only one of
-# the two may run at a time; starting this one stops the other.
+# Same DMMs as the AC test (datacap-logger.service), but --dc drives the old
+# DC baseline PSU (...-113353) instead of the AC one. Only one of the two may
+# run at a time, as they share the DMMs; starting this one stops the other.
 Conflicts=datacap-logger.service
 
 [Service]

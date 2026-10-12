@@ -67,9 +67,11 @@ TIMEOUT_MS = 5000
 GIT_INTERVAL = 300.0   # commit + push the CSV this often
 GIT_TIMEOUT = 90.0     # kill any single git command that runs longer than this
 STALE_LOCK_S = 600.0   # a .git lock file older than this is from a dead git
-# The NGE103B on this bench. PSU control is ON by default; use --no-psu for a
-# DMM-only run so a quick check never energises the PSU outputs.
+# The NGE103Bs: the AC test drives one, the DC test (--dc) the other, which
+# is the old DC baseline bench's PSU. PSU control is ON by default; use
+# --no-psu for a DMM-only run so a quick check never energises the PSU outputs.
 PSU_RESOURCE = "USB0::0x0AAD::0x0197::5601.3800k03-113360::0::INSTR"
+DC_PSU_RESOURCE = "USB0::0x0AAD::0x0197::5601.3800k03-113353::0::INSTR"
 
 # R&S returns 9.91E37 for "measurement not available". Parsing it as a real
 # number would put a garbage spike in your data.
@@ -873,7 +875,7 @@ def main():
                         "in the script's folder)")
     p.add_argument("--dc", action="store_true",
                    help="DC test: hold the PSU at a constant --psu-peak-current "
-                        "(same as --psu-mod-depth 0) and log to the DC CSV")
+                        "(same as --psu-mod-depth 0) on the DC PSU and log to the DC CSV")
     p.add_argument("--backend", default="@py",
                    help="'@py' for pyvisa-py, '' for installed vendor VISA")
     p.add_argument("--timeout", type=int, default=TIMEOUT_MS, help="VISA ms")
@@ -891,10 +893,10 @@ def main():
     p.add_argument("--git-repo-dir", default=SCRIPT_DIR,
                    help="git repo root (default: the folder this script lives in)")
     p.add_argument("--git-branch", default="main")
-    p.add_argument("--psu-resource", default=PSU_RESOURCE,
+    p.add_argument("--psu-resource", default=None,
                    help="VISA resource for the R&S NGE100 PSU, e.g. "
                         "USB0::0x0AAD::0x0197::<serial>::0::INSTR. "
-                        "Defaults to the bench NGE103B; see --no-psu.")
+                        "Defaults to the AC PSU, or with --dc the DC PSU; see --no-psu.")
     p.add_argument("--no-psu", action="store_true",
                    help="disable PSU waveform control entirely (DMM logging only); "
                         "the PSU outputs are never touched")
@@ -919,6 +921,8 @@ def main():
     args = p.parse_args()
     if args.dc:
         args.psu_mod_depth = 0.0
+    if args.psu_resource is None:
+        args.psu_resource = DC_PSU_RESOURCE if args.dc else PSU_RESOURCE
     if args.out is None:
         run = "DC" if args.dc or args.psu_mod_depth == 0 else "AC"
         args.out = os.path.join(SCRIPT_DIR, f"{TEST_NAME}_PI_USB_{run}_cell_hall_voltage_log.csv")
