@@ -4,3 +4,8 @@ timestamp,elapsed_s,status,Cell Voltage (V),Hall Voltage (V),psu_target_A_total,
 2026-10-12T12:28:02+10:00,0.0,reconnected,1.257700,-0.008228,,psu_down
 2026-10-12T12:28:32+10:00,30.0,ok,1.201690,-0.005751,,psu_down
 2026-10-12T12:29:02+10:00,60.0,ok,1.152650,-0.007466,,psu_down
+2026-10-12T12:29:32+10:00,90.0,ok,1.109410,-0.006141,,psu_down
+2026-10-12T12:30:02+10:00,120.0,ok,1.070510,-0.007544,,psu_down
+2026-10-12T12:31:02+10:00,0.0,disconnected,,,,psu_down
+2026-10-12T12:31:32+10:00,30.0,disconnected,,,,psu_down
+2026-10-12T12:32:02+10:00,60.0,reconnected,0.946040,-0.006612,,psu_down
