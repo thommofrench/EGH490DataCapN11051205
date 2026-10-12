@@ -2,7 +2,7 @@
 Description=DataCap AC test logger (two DMMs, square-wave PSU)
 After=network-online.target
 Wants=network-online.target
-# Same DMMs and PSU as the DC test (datacap-dc.service); only one runs at a time.
+# Same DMMs as the DC test (datacap-dc.service); only one runs at a time.
 Conflicts=datacap-dc.service
 
 [Service]
