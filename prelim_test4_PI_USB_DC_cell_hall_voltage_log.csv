@@ -911,3 +911,13 @@ timestamp,elapsed_s,status,Cell Voltage (V),Hall Voltage (V),psu_target_A_total,
 2026-11-09T17:03:52+10:00,5460.0,disconnected,,,,psu_down
 2026-11-09T17:04:22+10:00,5490.0,disconnected,,,,psu_down
 2026-11-09T17:04:52+10:00,5520.0,disconnected,,,,psu_down
+2026-11-09T17:05:22+10:00,5550.0,disconnected,,,,psu_down
+2026-11-09T17:05:52+10:00,5580.0,disconnected,,,,psu_down
+2026-11-09T17:06:22+10:00,5610.0,disconnected,,,,psu_down
+2026-11-09T17:06:52+10:00,5640.0,disconnected,,,,psu_down
+2026-11-09T17:07:22+10:00,5670.0,disconnected,,,,psu_down
+2026-11-09T17:07:52+10:00,5700.0,disconnected,,,,psu_down
+2026-11-09T17:08:22+10:00,5730.0,disconnected,,,,psu_down
+2026-11-09T17:08:52+10:00,5760.0,disconnected,,,,psu_down
+2026-11-09T17:09:22+10:00,5790.0,disconnected,,,,psu_down
+2026-11-09T17:09:52+10:00,5820.0,disconnected,,,,psu_down
